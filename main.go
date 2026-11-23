@@ -15,7 +15,20 @@ import (
 	"text/template"
 )
 
+// generator holds the state collected while generating code for one interface.
+type generator struct {
+	requiredPackages []requiredPackage
+	grpcTypes        []grpcStruct
+	goTypeMap        map[reflect.Type]goType
+	goTypes          []goType
+}
+
 func GenerateGRPCForInterface(grpcInterface any, targetPath string) {
+	g := &generator{goTypeMap: map[reflect.Type]goType{}}
+	g.generate(grpcInterface, targetPath)
+}
+
+func (g *generator) generate(grpcInterface any, targetPath string) {
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		panic(err)
 	}
@@ -42,7 +55,7 @@ func GenerateGRPCForInterface(grpcInterface any, targetPath string) {
 				hasContext = true
 				continue
 			}
-			paramType, err := parseType(param, false)
+			paramType, err := g.parseType(param, false)
 			if err != nil {
 				panic(fmt.Errorf("%s: parameter %d: %w", name, i, err))
 			}
@@ -54,7 +67,7 @@ func GenerateGRPCForInterface(grpcInterface any, targetPath string) {
 				hasErrorReturn = true
 				continue
 			}
-			returnType, err := parseType(param, false)
+			returnType, err := g.parseType(param, false)
 			if err != nil {
 				panic(fmt.Errorf("%s: return value %d: %w", name, i, err))
 			}
@@ -76,7 +89,7 @@ func GenerateGRPCForInterface(grpcInterface any, targetPath string) {
 				Type: param.GrpcProtoName,
 			})
 		}
-		grpcTypes = append(grpcTypes, paramStruct)
+		g.grpcTypes = append(g.grpcTypes, paramStruct)
 		resultStruct := grpcStruct{
 			Name: fmt.Sprintf("%sResponse", name),
 		}
@@ -86,7 +99,7 @@ func GenerateGRPCForInterface(grpcInterface any, targetPath string) {
 				Type: returnValue.GrpcProtoName,
 			})
 		}
-		grpcTypes = append(grpcTypes, resultStruct)
+		g.grpcTypes = append(g.grpcTypes, resultStruct)
 		grpcMethods = append(grpcMethods, grpcMethod{
 			Name:   name,
 			Param:  paramStruct.Name,
@@ -101,7 +114,7 @@ func GenerateGRPCForInterface(grpcInterface any, targetPath string) {
 	service := grpcService{
 		Name:        reflectIf.Name(),
 		Methods:     grpcMethods,
-		Types:       grpcTypes,
+		Types:       g.grpcTypes,
 		PackagePath: targetPath,
 		PackageName: filepath.Base(targetPath),
 	}
@@ -116,8 +129,8 @@ func GenerateGRPCForInterface(grpcInterface any, targetPath string) {
 		panic(err)
 	}
 
-	interfaceDesc.RequiredPackages = requiredPackages
-	interfaceDesc.RequiredTypes = goTypes
+	interfaceDesc.RequiredPackages = g.requiredPackages
+	interfaceDesc.RequiredTypes = g.goTypes
 
 	serverFile, err := os.Create(filepath.Join(targetPath, "server.go"))
 	if err != nil {
@@ -169,12 +182,10 @@ type requiredPackage struct {
 	InterfaceDependency bool
 }
 
-var requiredPackages []requiredPackage
-
-func findImportAlias(pkg string, interfaceDependency bool) string {
-	for i, existingPkg := range requiredPackages {
+func (g *generator) findImportAlias(pkg string, interfaceDependency bool) string {
+	for i, existingPkg := range g.requiredPackages {
 		if existingPkg.Path == pkg {
-			requiredPackages[i].InterfaceDependency = requiredPackages[i].InterfaceDependency || interfaceDependency
+			g.requiredPackages[i].InterfaceDependency = g.requiredPackages[i].InterfaceDependency || interfaceDependency
 			return existingPkg.Alias
 		}
 	}
@@ -182,7 +193,7 @@ func findImportAlias(pkg string, interfaceDependency bool) string {
 	var index int
 	for {
 		inUse := false
-		for _, requiredPkg := range requiredPackages {
+		for _, requiredPkg := range g.requiredPackages {
 			if alias == requiredPkg.Alias {
 				inUse = true
 				break
@@ -194,15 +205,13 @@ func findImportAlias(pkg string, interfaceDependency bool) string {
 		index++
 		alias = path.Base(pkg) + strconv.Itoa(index)
 	}
-	requiredPackages = append(requiredPackages, requiredPackage{
+	g.requiredPackages = append(g.requiredPackages, requiredPackage{
 		pkg,
 		alias,
 		interfaceDependency,
 	})
 	return alias
 }
-
-var grpcTypes []grpcStruct
 
 type grpcField struct {
 	Name string
@@ -214,31 +223,28 @@ type grpcStruct struct {
 	Fields []grpcField
 }
 
-var goTypeMap = map[reflect.Type]goType{}
-var goTypes []goType
-
 var binaryMarshalType = reflect.TypeOf((*encoding.BinaryMarshaler)(nil)).Elem()
 var binaryUnmarshalType = reflect.TypeOf((*encoding.BinaryUnmarshaler)(nil)).Elem()
 
-func parseType(t reflect.Type, indirectDependency bool) (goType, error) {
+func (g *generator) parseType(t reflect.Type, indirectDependency bool) (goType, error) {
 	var goTyp goType
 	goTyp.BaseName = t.Name()
 	pkg := t.PkgPath()
 	if pkg != "" {
-		goTyp.GoName = findImportAlias(pkg, !indirectDependency) + "." + goTyp.BaseName
+		goTyp.GoName = g.findImportAlias(pkg, !indirectDependency) + "." + goTyp.BaseName
 	} else {
 		goTyp.GoName = goTyp.BaseName
 	}
 
-	if parsedStruct, alreadyParsed := goTypeMap[t]; alreadyParsed {
+	if parsedStruct, alreadyParsed := g.goTypeMap[t]; alreadyParsed {
 		return parsedStruct, nil
 	}
 	if t.Implements(binaryMarshalType) && reflect.PointerTo(t).Implements(binaryUnmarshalType) {
 		goTyp.GrpcName = "[]byte"
 		goTyp.GrpcProtoName = "bytes"
 		goTyp.Kind = "BinaryMarshaler"
-		goTypes = append(goTypes, goTyp)
-		goTypeMap[t] = goTyp
+		g.goTypes = append(g.goTypes, goTyp)
+		g.goTypeMap[t] = goTyp
 		return goTyp, nil
 	}
 	switch t.Kind() {
@@ -275,7 +281,7 @@ func parseType(t reflect.Type, indirectDependency bool) (goType, error) {
 				goTyp.GoName = "[]byte"
 			}
 		} else {
-			subtype, err := parseType(t.Elem(), indirectDependency || goTyp.GoName != "")
+			subtype, err := g.parseType(t.Elem(), indirectDependency || goTyp.GoName != "")
 			if err != nil {
 				return goType{}, fmt.Errorf("type %s: %w", t.Name(), err)
 			}
@@ -304,7 +310,7 @@ func parseType(t reflect.Type, indirectDependency bool) (goType, error) {
 				goTyp.GoName = fmt.Sprintf("[%d]byte", t.Len())
 			}
 		} else {
-			subtype, err := parseType(t.Elem(), indirectDependency || goTyp.GoName != "")
+			subtype, err := g.parseType(t.Elem(), indirectDependency || goTyp.GoName != "")
 			if err != nil {
 				return goType{}, fmt.Errorf("type %s: %w", t.Name(), err)
 			}
@@ -323,7 +329,7 @@ func parseType(t reflect.Type, indirectDependency bool) (goType, error) {
 		}
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
-			fieldtype, err := parseType(field.Type, true)
+			fieldtype, err := g.parseType(field.Type, true)
 			if err != nil {
 				return goType{}, fmt.Errorf("field %s.%s: %w", t.Name(), field.Name, err)
 			}
@@ -339,12 +345,12 @@ func parseType(t reflect.Type, indirectDependency bool) (goType, error) {
 		goTyp.GrpcName = "*" + name
 		goTyp.GrpcProtoName = name
 		goTyp.Kind = kindStruct
-		grpcTypes = append(grpcTypes, grpcType)
+		g.grpcTypes = append(g.grpcTypes, grpcType)
 	default:
 		return goType{}, fmt.Errorf("unsupported kind %s", t.Kind())
 	}
-	goTypeMap[t] = goTyp
-	goTypes = append(goTypes, goTyp)
+	g.goTypeMap[t] = goTyp
+	g.goTypes = append(g.goTypes, goTyp)
 	return goTyp, nil
 }
 
